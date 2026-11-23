@@ -1,79 +1,69 @@
-// news-image-20261122: the entry is the picture beside this file.
-// The program proves the picture is a whole PNG or JPEG of at most
-// 1 MiB and at most 1024 by 1024 pixels, then copies it byte for
-// byte to /output/entry.png. The judge sees exactly those bytes.
-//
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in
-// for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-//
-// The picture lives in entry.png (1024 by 1024 JPEG, rendered from
-// assets/source-rev2.webp, the approved rev2 image). This program
-// never edits a pixel; it only checks the file and copies it, so
-// two runs always write identical bytes.
-
-import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
+// news-image-20261122 — dense revision (layout rev2): copy the rendered
+// entry.png byte-for-byte to the output directory. Validates the image
+// first (format, dimensions, size cap) so a bad asset fails loudly
+// instead of shipping an invalid entry.
+import { copyFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
-const MAX_BYTES = 1024 * 1024;
-const MAX_SIDE = 1024;
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const SOURCE = new URL('./entry.png', import.meta.url);
+const SRC = new URL('./entry.png', import.meta.url);
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+const MAX_BYTES = 1048576;
+const MAX_DIM = 1024;
 
-function reject(reason) {
-  throw new Error(`entry.png rejected: ${reason}`);
+function fail(message) {
+  console.error(`main.ts: ${message}`);
+  process.exit(1);
 }
 
-function pngSize(bytes) {
-  // PNG signature, then the IHDR chunk: width and height, 4 bytes
-  // each, big-endian, right after the 8-byte chunk header.
-  if (bytes.length < 24) reject('PNG too short for an IHDR chunk');
-  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
-}
-
-function jpegSize(bytes) {
-  // A JPEG starts FF D8. Each segment is FF <marker> <2-byte length>,
-  // except the standalone markers, which carry no length. The frame
-  // header (SOF0 or SOF2) holds height then width, 2 bytes each,
-  // after one byte of precision.
-  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) reject('not a JPEG (missing FF D8)');
-  let at = 2;
-  while (at + 9 <= bytes.length) {
-    if (bytes[at] !== 0xff) reject('bad marker prefix in JPEG');
-    const marker = bytes[at + 1];
-    if (marker === 0xd9) reject('end of image with no frame header');
-    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      at += 2;
+function jpegSize(buf) {
+  // Walk JPEG markers to the first SOF0/SOF2 frame and read its dimensions.
+  let pos = 2;
+  while (pos + 9 < buf.length) {
+    if (buf[pos] !== 0xff) fail('entry.png: bad JPEG marker');
+    const marker = buf[pos + 1];
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      pos += 2;
       continue;
     }
-    const length = bytes.readUInt16BE(at + 2);
+    const len = buf.readUInt16BE(pos + 2);
     if (marker === 0xc0 || marker === 0xc2) {
-      return { height: bytes.readUInt16BE(at + 5), width: bytes.readUInt16BE(at + 7) };
+      return { height: buf.readUInt16BE(pos + 5), width: buf.readUInt16BE(pos + 7) };
     }
-    at += 2 + length;
+    pos += 2 + len;
   }
-  reject('no frame header found in JPEG');
+  fail('entry.png: no JPEG SOF frame found');
 }
 
-function imageSize(bytes) {
-  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
-    return pngSize(bytes);
+function pngSize(buf) {
+  if (buf.length < 24 || buf.toString('ascii', 12, 16) !== 'IHDR') {
+    fail('entry.png: bad PNG header');
   }
-  return jpegSize(bytes);
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
 }
 
-const bytes = readFileSync(SOURCE);
-if (bytes.length > MAX_BYTES) reject(`${bytes.length} bytes exceeds the ${MAX_BYTES} byte limit`);
-const { width, height } = imageSize(bytes);
-if (width > MAX_SIDE || height > MAX_SIDE) reject(`${width}x${height} exceeds ${MAX_SIDE}x${MAX_SIDE}`);
+const buf = readFileSync(SRC);
+const size = statSync(SRC).size;
+if (size > MAX_BYTES) fail(`entry.png is ${size} bytes, over the 1 MiB cap`);
+
+let dims;
+if (buf[0] === 0xff && buf[1] === 0xd8) {
+  dims = jpegSize(buf);
+} else if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+  dims = pngSize(buf);
+} else {
+  fail('entry.png: not a PNG or JPEG (bad magic bytes)');
+}
+if (dims.width > MAX_DIM || dims.height > MAX_DIM) {
+  fail(`entry.png is ${dims.width}x${dims.height}, over the 1024x1024 cap`);
+}
+
 mkdirSync(OUT_DIR, { recursive: true });
-const target = join(OUT_DIR, 'entry.png');
-copyFileSync(SOURCE, target);
-const digest = createHash('sha256').update(bytes).digest('hex');
-// Read the copy back: the grader must judge exactly the bytes this
-// program checked, so a copy that differs is a failure, not a warning.
-const copied = readFileSync(target);
-const copiedDigest = createHash('sha256').update(copied).digest('hex');
-if (copiedDigest !== digest) reject(`copied entry.png sha256 ${copiedDigest} differs from source ${digest}`);
-console.log(`entry.png ${width}x${height} ${bytes.length} bytes sha256 ${digest} -> ${target}`);
+const outPath = join(OUT_DIR, 'entry.png');
+copyFileSync(SRC, outPath);
+
+// Read the copy back and confirm it is byte-identical to the source.
+const check = readFileSync(outPath);
+const digest = (b) => createHash('sha256').update(b).digest('hex');
+if (digest(check) !== digest(buf)) fail('entry.png: copy differs from source');
+console.log(`wrote ${outPath}: ${size} bytes, ${dims.width}x${dims.height}, ${buf[0] === 0xff ? 'JPEG' : 'PNG'}, sha256 ${digest(buf)}`);
